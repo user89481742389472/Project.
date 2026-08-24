@@ -1,0 +1,6 @@
+{
+  "name": "Simple Chatbot",
+  "description": "A very simple and straightforward chatbot interface with a plain white background and black text input fields.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
