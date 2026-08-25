@@ -13,6 +13,7 @@ export interface Message {
   images?: ImageAttachment[];
   timestamp: number;
   modelUsed?: string;
+  groundingSources?: { uri: string; title: string }[];
 }
 
 export interface ModelOption {
@@ -24,35 +25,30 @@ export interface ModelOption {
 
 export const AVAILABLE_MODELS: ModelOption[] = [
   {
-    id: 'gemini-3.7-flash',
-    name: 'Gemini 3.7 Flash',
-    tag: 'DEFAULT / SMART',
-    description: 'Balanced speed, advanced reasoning, and multimodal analysis.',
-  },
-  {
     id: 'gemini-3.1-flash-lite',
     name: 'Gemini 3.1 Flash Lite',
-    tag: 'CHEAPEST / HIGHEST LIMITS',
+    tag: 'DEFAULT / MAX QUOTA',
     description: 'Lowest cost per token with highest rate limits & fastest response times.',
   },
   {
-    id: 'gemini-3.6-flash',
-    name: 'Gemini 3.6 Flash',
-    tag: 'BALANCED',
-    description: 'Fast, dependable performance for diverse conversational tasks.',
+    id: 'gemini-3.7-flash',
+    name: 'Gemini 3.7 Flash',
+    tag: 'MOST CAPABLE',
+    description: 'Advanced multimodal reasoning, deep coding, and agentic workflows.',
   },
   {
-    id: 'gemini-3.5-flash-lite',
-    name: 'Gemini 3.5 Flash Lite',
-    tag: 'LIGHTWEIGHT',
-    description: 'Cost-efficient and fast with high throughput.',
+    id: 'gemini-3.5-flash',
+    name: 'Gemini 3.5 Flash',
+    tag: 'BALANCED',
+    description: 'High-efficiency multimodal model with strong tool execution.',
   },
   {
     id: 'gemini-flash-latest',
-    name: 'Gemini Flash Latest',
-    tag: 'LATEST RELEASE',
-    description: 'Always routes to the latest Flash model release.',
+    name: 'Gemini Flash (Latest)',
+    tag: 'AUTO LATEST',
+    description: 'Always routes to the latest stable Google Flash model release.',
   },
 ];
 
-
+export const DEFAULT_MODEL = AVAILABLE_MODELS[0];
+export const ENFORCED_MODEL = AVAILABLE_MODELS[0];

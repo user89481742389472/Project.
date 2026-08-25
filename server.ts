@@ -6,21 +6,6 @@ import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
-let aiClient: GoogleGenAI | null = null;
-function getAI(): GoogleGenAI {
-  if (!aiClient) {
-    aiClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
-  }
-  return aiClient;
-}
-
 // Determines if an error or finish reason is related to safety/policy refusal
 function isRefusalOrSafety(errOrText: any): boolean {
   if (!errOrText) return false;
@@ -78,18 +63,36 @@ function parseErrorMessage(err: any): string {
     // ignore parse error
   }
 
+  if (raw.includes("API_KEY_INVALID") || raw.includes("API key not valid") || raw.includes("400") && raw.includes("API_KEY")) {
+    return "API key is not valid. Please check your key from Google AI Studio and ensure there are no extra spaces.";
+  }
   if (raw.includes("503") || raw.includes("high demand") || raw.includes("UNAVAILABLE")) {
     return "The AI service is experiencing high demand right now. Please try again in a moment.";
   }
   if (raw.includes("429") || raw.includes("RESOURCE_EXHAUSTED") || raw.includes("quota")) {
-    return "Rate limit reached. Please wait a brief moment before sending another message.";
+    return "Rate limit or quota exhausted on this API key. Please check your Google AI Studio account.";
   }
-  if (raw.includes("API_KEY") || raw.includes("403") || raw.includes("PERMISSION_DENIED")) {
-    return "Invalid or unconfigured API key. Please check your settings.";
+  if (raw.includes("403") || raw.includes("PERMISSION_DENIED")) {
+    return "Permission denied for this API key. Make sure the Generative Language API is enabled on your project.";
   }
 
   return raw;
 }
+
+// List of fallback chains to ensure compatibility across all Google AI Studio account tiers
+const MODEL_FALLBACK_CHAINS: Record<string, string[]> = {
+  "gemini-3.7-flash": ["gemini-3.7-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"],
+  "gemini-3.5-flash": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"],
+  "gemini-3.1-flash-lite": ["gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.5-flash", "gemini-3.7-flash"],
+  "gemini-flash-latest": ["gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-3.7-flash", "gemini-3.5-flash"],
+};
+
+const DEFAULT_FALLBACK_LIST = [
+  "gemini-3.1-flash-lite",
+  "gemini-flash-latest",
+  "gemini-3.5-flash",
+  "gemini-3.7-flash",
+];
 
 async function startServer() {
   const app = express();
@@ -103,21 +106,113 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
+  // Key Validation API Endpoint
+  app.post("/api/validate-key", async (req, res) => {
+    try {
+      const authHeader = (req.headers["x-gemini-api-key"] as string) || "";
+      const bodyKey = req.body?.apiKey || "";
+      const rawKey = (authHeader || bodyKey || process.env.GEMINI_API_KEY || "").trim();
+
+      if (!rawKey) {
+        return res.status(400).json({
+          valid: false,
+          error: "No API key provided. Please enter a valid Gemini API key.",
+        });
+      }
+
+      // Quick sanity check on format
+      if (rawKey.length < 20) {
+        return res.status(400).json({
+          valid: false,
+          error: "API key format appears invalid (too short).",
+        });
+      }
+
+      // Initialize client with user key
+      const ai = new GoogleGenAI({ apiKey: rawKey });
+
+      // Test against the fastest lightweight models in parallel with a fast abort race
+      const fastModelsToTest = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.7-flash"];
+
+      // Check models with Promise.any so the first successful response validates immediately
+      const validatePromises = fastModelsToTest.map(async (model) => {
+        try {
+          const testResp = await ai.models.generateContent({
+            model,
+            contents: "hi",
+          });
+          if (testResp) {
+            return { valid: true, model };
+          }
+          throw new Error("Empty response");
+        } catch (err: any) {
+          const parsed = parseErrorMessage(err);
+          // If the model responded with safety/policy/refusal or even 429 quota reached, the key is authentic!
+          if (
+            isRefusalOrSafety(err) ||
+            parsed.includes("cannot assist") ||
+            parsed.includes("Rate limit or quota exhausted") ||
+            parsed.includes("high demand")
+          ) {
+            return { valid: true, model };
+          }
+          throw err;
+        }
+      });
+
+      // Wrap in a 5-second total timeout
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Verification timed out. Check your connection or API key.")), 5000)
+      );
+
+      try {
+        await Promise.race([
+          Promise.any(validatePromises),
+          timeoutPromise,
+        ]);
+
+        return res.json({ valid: true, message: "API key successfully verified." });
+      } catch (raceErr: any) {
+        // Collect errors if all failed
+        let errMessage = "Could not verify API key with Google AI Studio.";
+        if (raceErr?.errors && Array.isArray(raceErr.errors) && raceErr.errors.length > 0) {
+          errMessage = parseErrorMessage(raceErr.errors[0]);
+        } else if (raceErr?.message) {
+          errMessage = parseErrorMessage(raceErr.message);
+        }
+        return res.status(400).json({
+          valid: false,
+          error: errMessage,
+        });
+      }
+    } catch (error: any) {
+      console.error("Key validation error:", error);
+      return res.status(400).json({
+        valid: false,
+        error: parseErrorMessage(error),
+      });
+    }
+  });
+
   // Chat API
   app.post("/api/chat", async (req, res) => {
     try {
-      const { messages, model: requestedModel } = req.body;
+      const { messages, model: requestedModel, useGoogleSearch } = req.body;
       if (!messages || !Array.isArray(messages) || messages.length === 0) {
         return res.status(400).json({ error: "Missing or invalid messages array" });
       }
 
-      if (!process.env.GEMINI_API_KEY) {
-        return res.status(500).json({
-          error: "GEMINI_API_KEY is not configured on the server. Please add your key in Settings > Secrets.",
+      const authHeader = (req.headers["x-gemini-api-key"] as string) || "";
+      const bodyKey = req.body?.apiKey || "";
+      const rawKey = (authHeader || bodyKey || process.env.GEMINI_API_KEY || "").trim();
+
+      if (!rawKey) {
+        return res.status(401).json({
+          error: "Gemini API key required. Please enter your personal Google Gemini API key.",
         });
       }
 
-      const ai = getAI();
+      const ai = new GoogleGenAI({ apiKey: rawKey });
 
       // Format messages into Gemini contents format
       const rawContents: { role: "user" | "model"; parts: any[] }[] = [];
@@ -181,24 +276,30 @@ async function startServer() {
 
       let streamSuccess = false;
       let totalTextSent = 0;
-      let modelUsed = requestedModel || "gemini-3.7-flash";
+      let lastStreamError: any = null;
 
-      // Priority list based on user's chosen model
-      const preferredModel = (typeof requestedModel === "string" && requestedModel.trim()) || "gemini-3.7-flash";
-      const candidateModels = [
-        preferredModel,
-        "gemini-3.7-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-      ].filter((m, idx, arr) => arr.indexOf(m) === idx);
+      // Candidate models to iterate through if a specific one is unavailable
+      const preferredModel = (typeof requestedModel === "string" && requestedModel.trim()) || "gemini-3.1-flash-lite";
+      const modelChain = MODEL_FALLBACK_CHAINS[preferredModel] || [preferredModel];
+      const candidateModels = Array.from(new Set([...modelChain, ...DEFAULT_FALLBACK_LIST]));
 
       for (const model of candidateModels) {
         try {
-          const responseStream = await ai.models.generateContentStream({
+          lastStreamError = null;
+          
+          const requestConfig: any = {
             model,
             contents: formattedContents,
-          });
+          };
+
+          if (useGoogleSearch) {
+            requestConfig.config = {
+              tools: [{ googleSearch: {} }],
+              systemInstruction: `The current date and time is ${new Date().toLocaleString()}. You must use the Google Search tool to browse the internet and find up-to-date, real-world information before answering the user's question, especially for tech releases. Never rely solely on your training data when asked about recent events.`,
+            };
+          }
+
+          const responseStream = await ai.models.generateContentStream(requestConfig);
 
           for await (const chunk of responseStream) {
             const candidate = chunk.candidates?.[0];
@@ -206,77 +307,65 @@ async function startServer() {
 
             if (finishReason && finishReason !== "STOP" && isRefusalOrSafety(finishReason)) {
               const refusal = totalTextSent === 0 ? "I am sorry, but I cannot assist with that request." : "\n\n[Response stopped by safety filter]";
-              res.write(`data: ${JSON.stringify({ text: refusal, model })} \n\n`);
+              res.write(`data: ${JSON.stringify({ text: refusal, model })}\n\n`);
               (res as any).flush?.();
               totalTextSent += refusal.length;
               streamSuccess = true;
-              modelUsed = model;
               break;
             }
 
             const text = chunk.text || "";
-            if (text) {
-              res.write(`data: ${JSON.stringify({ text, model })}\n\n`);
+            let chunkData: any = { text, model };
+            
+            if (candidate?.groundingMetadata?.groundingChunks) {
+              chunkData.groundingSources = candidate.groundingMetadata.groundingChunks
+                .map((g: any) => g.web)
+                .filter((w: any) => w && w.uri && w.title);
+            }
+
+            if (text || chunkData.groundingSources) {
+              res.write(`data: ${JSON.stringify(chunkData)}\n\n`);
               (res as any).flush?.();
               totalTextSent += text.length;
               streamSuccess = true;
-              modelUsed = model;
             }
           }
 
           if (streamSuccess || totalTextSent > 0) {
-            break; // Finished successfully with this model
+            break; // Finished successfully
           }
         } catch (modelErr: any) {
-          console.warn(`Model ${model} stream error:`, modelErr?.message || modelErr);
+          if (!lastStreamError) {
+            lastStreamError = modelErr;
+          }
           if (isRefusalOrSafety(modelErr)) {
             const refusalMsg = "I am sorry, but I cannot assist with that request.";
             res.write(`data: ${JSON.stringify({ text: refusalMsg, model })}\n\n`);
             (res as any).flush?.();
             totalTextSent += refusalMsg.length;
             streamSuccess = true;
-            modelUsed = model;
             break;
           }
-          // If already sent some text, don't try next model to avoid duplicate response starts
           if (totalTextSent > 0) {
             break;
           }
+          // Continue to next candidate model
         }
       }
 
-      // If streaming produced no text, try a non-streaming fallback
-      if (totalTextSent === 0) {
-        try {
-          const directResponse = await ai.models.generateContent({
-            model: preferredModel,
-            contents: formattedContents,
-          });
+      // If streaming produced no text and had no success, emit the last error
+      if (totalTextSent === 0 && !streamSuccess) {
+        const isRefusal = isRefusalOrSafety(lastStreamError);
+        const cleanMsg = isRefusal
+          ? "I am sorry, but I cannot assist with that request."
+          : parseErrorMessage(lastStreamError || "All AI models returned empty responses.");
 
-          const directText = directResponse.text || "";
-          if (directText) {
-            res.write(`data: ${JSON.stringify({ text: directText, model: preferredModel })}\n\n`);
-            (res as any).flush?.();
-            totalTextSent += directText.length;
-          } else {
-            const fallbackRefusal = "I am sorry, but I cannot assist with that request.";
-            res.write(`data: ${JSON.stringify({ text: fallbackRefusal, model: preferredModel })}\n\n`);
-            (res as any).flush?.();
-            totalTextSent += fallbackRefusal.length;
-          }
-        } catch (fallbackErr: any) {
-          const isRefusal = isRefusalOrSafety(fallbackErr);
-          const cleanMsg = isRefusal
-            ? "I am sorry, but I cannot assist with that request."
-            : parseErrorMessage(fallbackErr);
-
-          if (isRefusal) {
-            res.write(`data: ${JSON.stringify({ text: cleanMsg, model: preferredModel })}\n\n`);
-          } else {
-            res.write(`data: ${JSON.stringify({ error: cleanMsg })}\n\n`);
-          }
-          (res as any).flush?.();
+        if (isRefusal) {
+          res.write(`data: ${JSON.stringify({ text: cleanMsg, model: preferredModel })}\n\n`);
+        } else {
+          res.write(`data: ${JSON.stringify({ error: cleanMsg })}\n\n`);
         }
+        (res as any).flush?.();
       }
 
       res.write(`data: [DONE]\n\n`);
